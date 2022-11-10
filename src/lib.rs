@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{
   plugin::{Builder as PluginBuilder, TauriPlugin},
-  Manager, PhysicalPosition, PhysicalSize, Position, RunEvent, Runtime, Size, Window, WindowEvent,
+  LogicalPosition, LogicalSize, Manager, RunEvent, Runtime, Window, WindowEvent,
 };
 
 use std::{
@@ -29,12 +29,29 @@ pub enum Error {
   Bincode(#[from] Box<bincode::ErrorKind>),
 }
 
+/// Defines how the window visibility should be restored.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ShowMode {
+  /// The window will always be shown, regardless of what the last stored state was.
+  Always,
+  /// The window will be automatically shown if the last stored state for visibility was `true`.
+  LastSaved,
+  /// The window will not be automatically shown by this plugin.
+  Never,
+}
+
+impl Default for ShowMode {
+  fn default() -> Self {
+    Self::LastSaved
+  }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct WindowMetadata {
-  width: u32,
-  height: u32,
+  width: f64,
+  height: f64,
   x: i32,
   y: i32,
   maximized: bool,
@@ -69,21 +86,16 @@ impl<R: Runtime> AppHandleExt for tauri::AppHandle<R> {
 }
 
 pub trait WindowExt {
-  fn restore_state(&self, auto_show: bool) -> tauri::Result<()>;
+  fn restore_state(&self, show_mode: ShowMode) -> tauri::Result<()>;
 }
 
 impl<R: Runtime> WindowExt for Window<R> {
-  fn restore_state(&self, auto_show: bool) -> tauri::Result<()> {
+  fn restore_state(&self, show_mode: ShowMode) -> tauri::Result<()> {
     let cache = self.state::<WindowStateCache>();
     let mut c = cache.0.lock().unwrap();
     let mut should_show = true;
     if let Some(state) = c.get(self.label()) {
       self.set_decorations(state.decorated)?;
-
-      self.set_size(Size::Physical(PhysicalSize {
-        width: state.width,
-        height: state.height,
-      }))?;
 
       let mut pos: Option<(i32, i32)> = None;
       for m in self.available_monitors()? {
@@ -92,18 +104,24 @@ impl<R: Runtime> WindowExt for Window<R> {
           break;
         }
       }
+
+      self.set_size(LogicalSize {
+        width: state.width,
+        height: state.height,
+      })?;
+
       let (x, y) = match pos {
         Some((x, y)) => (x, y),
         None => {
           if let Some(m) = self.current_monitor()? {
-            let mpos = m.position();
+            let mpos = m.position().to_logical::<i32>(m.scale_factor());
             (mpos.x + 100, mpos.y + 100)
           } else {
             (100, 100)
           }
         }
       };
-      self.set_position(Position::Physical(PhysicalPosition { x, y }))?;
+      self.set_position(LogicalPosition { x, y })?;
 
       if state.maximized {
         self.maximize()?;
@@ -112,8 +130,12 @@ impl<R: Runtime> WindowExt for Window<R> {
 
       should_show = state.visible;
     } else {
-      let PhysicalSize { width, height } = self.inner_size()?;
-      let PhysicalPosition { x, y } = self.outer_position()?;
+      let scale_factor = self
+        .current_monitor()?
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.);
+      let LogicalSize { width, height } = self.inner_size()?.to_logical(scale_factor);
+      let LogicalPosition { x, y } = self.outer_position()?.to_logical(scale_factor);
       let maximized = self.is_maximized().unwrap_or(false);
       let visible = self.is_visible().unwrap_or(true);
       let decorated = self.is_decorated().unwrap_or(true);
@@ -139,7 +161,8 @@ impl<R: Runtime> WindowExt for Window<R> {
         },
       );
     }
-    if auto_show && should_show {
+
+    if show_mode == ShowMode::Always || (show_mode == ShowMode::LastSaved && should_show) {
       self.show()?;
       self.set_focus()?;
     }
@@ -148,34 +171,24 @@ impl<R: Runtime> WindowExt for Window<R> {
   }
 }
 
+#[derive(Default)]
 pub struct Builder {
-  auto_show: bool,
+  show_mode: ShowMode,
   denylist: HashSet<String>,
   skip_initial_state: HashSet<String>,
 }
 
-impl Default for Builder {
-  fn default() -> Self {
-    Builder {
-      auto_show: true,
-      denylist: Default::default(),
-      skip_initial_state: Default::default(),
-    }
-  }
-}
-
 impl Builder {
-  /// Whether to enable or disable automatically showing the window
+  /// Sets how the window visibility should be restored.
   ///
-  /// - `true`: the window will be automatically shown if the last stored state for visibility was `true`
-  /// - `false`: the window will not be automatically shown by this plugin
-  pub fn with_auto_show(mut self, auto_show: bool) -> Self {
-    self.auto_show = auto_show;
+  /// The default is [`ShowMode::LastSaved`]
+  pub fn with_show_mode(mut self, show_mode: ShowMode) -> Self {
+    self.show_mode = show_mode;
     self
   }
 
   /// Sets a list of windows that shouldn't be tracked and managed by this plugin
-  /// for example splash screen widnows.
+  /// for example splash screen windows.
   pub fn with_denylist(mut self, denylist: &[&str]) -> Self {
     self.denylist = denylist.iter().map(|l| l.to_string()).collect();
     self
@@ -215,7 +228,7 @@ impl Builder {
         }
 
         if !self.skip_initial_state.contains(window.label()) {
-          let _ = window.restore_state(self.auto_show);
+          let _ = window.restore_state(self.show_mode);
         }
 
         let cache = window.state::<WindowStateCache>();
@@ -230,8 +243,10 @@ impl Builder {
               state.maximized = is_maximized;
 
               if let Some(monitor) = window_clone.current_monitor().unwrap() {
+                let scale_factor = monitor.scale_factor();
+                let position = position.to_logical(scale_factor);
                 state.monitor = monitor.name().map(ToString::to_string).unwrap_or_default();
-                let monitor_position = monitor.position();
+                let monitor_position = monitor.position().to_logical(scale_factor);
                 // save only window positions that are inside the current monitor
                 if position.x > monitor_position.x
                   && position.y > monitor_position.y
@@ -244,6 +259,12 @@ impl Builder {
             }
           }
           WindowEvent::Resized(size) => {
+            let scale_factor = window_clone
+              .current_monitor()
+              .ok()
+              .map(|m| m.map(|m| m.scale_factor()).unwrap_or(1.))
+              .unwrap_or(1.);
+            let size = size.to_logical(scale_factor);
             let mut c = cache.lock().unwrap();
             if let Some(state) = c.get_mut(&label) {
               let is_maximized = window_clone.is_maximized().unwrap_or(false);
@@ -253,7 +274,7 @@ impl Builder {
               state.fullscreen = is_fullscreen;
 
               // It doesn't make sense to save a window with 0 height or width
-              if size.width > 0 && size.height > 0 && !is_maximized {
+              if size.width > 0. && size.height > 0. && !is_maximized {
                 state.width = size.width;
                 state.height = size.height;
               }
