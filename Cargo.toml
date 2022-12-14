@@ -8,7 +8,7 @@ repository = "https://github.com/tauri-apps/tauri-plugin-window-state"
 edition = "2021"
 
 [dependencies]
-tauri = { git = "https://github.com/luoffei/tauri.git", branch = "1.2.1"}
+tauri = { git = "https://github.com/luoffei/tauri.git", branch = "1.2.2"}
 serde = "1.0"
 thiserror = "1"
 bincode = "1.3"
